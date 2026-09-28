@@ -164,6 +164,14 @@ python scoring/score_ovo_bench.py \
 ```
 </details>
 
+## Streaming-memory v1 extension
+
+Add `--video-memory` to the existing StreamingBench command. Earlier frames
+maintain one bounded memory space per video, with separate records for useful
+facts and state changes. Memory writing never sees the questions; answering
+still uses SimpleStream's original recent-window inference.
+[Usage and checks](docs/streaming_memory_v1.md).
+
 ## Contact
 
 If you have any questions about the paper, codebase, or experimental setup, please feel free to contact [shenyujiao18@gmail.com](mailto:shenyujiao18@gmail.com).

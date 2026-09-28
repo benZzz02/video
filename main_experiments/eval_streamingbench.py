@@ -1,9 +1,10 @@
 """
 StreamingBench recent-window evaluation aligned with the no-cache OVO-stack baseline.
 
-This release script only supports the recency baseline (`--top-k 0`):
+By default, this script runs the recency baseline (`--top-k 0`):
 decode the time window ending at each question timestamp and answer from the
 most recent N chunks without feature cache or retrieval.
+Optional --video-memory adds bounded semantic records from earlier video frames.
 """
 
 from __future__ import annotations
@@ -142,6 +143,7 @@ def run_benchmark(
     max_qa_tokens: int,
     recent_frames_only: int,
     context_time: int,
+    video_memory: bool = False,
 ) -> None:
     if top_k != 0:
         raise ValueError(
@@ -168,6 +170,8 @@ def run_benchmark(
 
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, "results_incremental.jsonl")
+    if video_memory and os.path.exists(ckpt_path) and os.path.getsize(ckpt_path):
+        raise ValueError("Memory runs require a fresh output directory; stateful resume is unsupported.")
     all_results, done_keys = load_jsonl_results(ckpt_path)
 
     qa = RecentWindowQAModel(
@@ -175,6 +179,23 @@ def run_benchmark(
         device=qa_device,
         max_new_tokens=max_qa_tokens,
     )
+
+    memory_segment_frames = None
+    if video_memory:
+        memory_window_seconds = (
+            float(context_time)
+            if context_time > 0
+            else float(recent_frames_only) * float(chunk_duration)
+        )
+        memory_segment_frames = max(1, int(math.ceil(memory_window_seconds * float(fps))))
+
+    def generate_memory(images, text, limit):
+        saved = qa.max_new_tokens
+        try:
+            qa.max_new_tokens = limit
+            return qa.generate_from_frames(images, text)
+        finally:
+            qa.max_new_tokens = saved
 
     legacy_done_keys = {key for key in done_keys if isinstance(key, str)}
 
@@ -196,6 +217,17 @@ def run_benchmark(
                 processed += len(questions)
                 continue
 
+            memory_session = None
+            if video_memory:
+                from lib.streaming_memory import VideoMemorySession
+
+                memory_session = VideoMemorySession(
+                    path=video_path,
+                    fps=fps,
+                    generate=generate_memory,
+                    segment_frames=memory_segment_frames,
+                )
+
             for question in questions:
                 processed += 1
                 if is_done(video_basename, question):
@@ -212,6 +244,9 @@ def run_benchmark(
                 prompt = build_prompt(question)
 
                 try:
+                    if memory_session is not None:
+                        memory_session.advance_to(ts_sec)
+                        prompt = memory_session.augment(prompt)
                     result, decode_backend = query_recent_window(
                         qa=qa,
                         video_path=video_path,
@@ -243,6 +278,7 @@ def run_benchmark(
                         "num_vision_tokens": result.num_vision_tokens,
                         "num_vision_tokens_before": result.num_vision_tokens_before,
                         "num_vision_tokens_after": result.num_vision_tokens_after,
+                        **({"memory": memory_session.usage()} if memory_session is not None else {}),
                     }
                     logger.info(
                         "  [%d/%d] %s %s -> %s (gt=%s)",
@@ -273,21 +309,33 @@ def run_benchmark(
                 ckpt_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 ckpt_file.flush()
 
+            if memory_session is not None:
+                memory_session.close()
+
     print_summary(all_results)
     summary = compute_summary(all_results)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config = {
+        "qa_model": qa_model,
+        "chunk_duration": chunk_duration,
+        "fps": fps,
+        "top_k": top_k,
+        "recent_frames_only": recent_frames_only,
+        "context_time": context_time,
+        "cache_enabled": False,
+    }
+    if video_memory:
+        config.update(
+            {
+                "video_memory": True,
+                "memory_protocol": "claude-style-semantic-records",
+                "memory_segment_frames": memory_segment_frames,
+            }
+        )
     save_json(
         os.path.join(output_dir, f"streaming_bench_results_{timestamp}.json"),
         {
-            "config": {
-                "qa_model": qa_model,
-                "chunk_duration": chunk_duration,
-                "fps": fps,
-                "top_k": top_k,
-                "recent_frames_only": recent_frames_only,
-                "context_time": context_time,
-                "cache_enabled": False,
-            },
+            "config": config,
             "summary": summary,
             "results": all_results,
         },
@@ -310,6 +358,7 @@ def main() -> None:
     parser.add_argument("--max-qa-tokens", type=int, default=256)
     parser.add_argument("--recent-frames-only", "--recent-frames-buffer", dest="recent_frames_only", type=int, default=4)
     parser.add_argument("--context-time", type=int, default=-1)
+    parser.add_argument("--video-memory", action="store_true")
     args = parser.parse_args()
 
     if args.clip_model or args.clip_device:
@@ -340,6 +389,7 @@ def main() -> None:
         max_qa_tokens=args.max_qa_tokens,
         recent_frames_only=args.recent_frames_only,
         context_time=args.context_time,
+        video_memory=args.video_memory,
     )
 
 
