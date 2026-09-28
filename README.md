@@ -170,6 +170,8 @@ Add `--video-memory` to the existing StreamingBench command. Earlier frames
 maintain one bounded memory space per video, with separate records for useful
 facts and state changes. Memory writing never sees the questions; answering
 still uses SimpleStream's original recent-window inference.
+Readable per-video snapshots are written under
+`<output-dir>/video_memory/<video>/` while the benchmark runs.
 [Usage and checks](docs/streaming_memory_v1.md).
 
 ## Contact

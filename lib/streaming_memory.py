@@ -5,8 +5,10 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 import json
 import math
+import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from typing import Any, Callable, Iterable, Iterator
 
@@ -43,6 +45,41 @@ def _index_line(record: MemoryRecord) -> str:
 def _record_bytes(record: MemoryRecord) -> int:
     return len(
         json.dumps(asdict(record), ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _record_markdown(record: MemoryRecord) -> str:
+    return (
+        "---\n"
+        f"name: {json.dumps(record.name, ensure_ascii=False)}\n"
+        f"description: {json.dumps(record.description, ensure_ascii=False)}\n"
+        f"type: {json.dumps(record.type, ensure_ascii=False)}\n"
+        "---\n\n"
+        f"{record.content}\n"
     )
 
 
@@ -151,6 +188,8 @@ class VideoMemory:
         self.dropped_frames = 0
         self.write_seconds = 0.0
         self.last_write_error: str | None = None
+        self.snapshot_errors = 0
+        self.last_snapshot_error: str | None = None
 
     def observe(self, timestamp: float, image: Any) -> None:
         if not math.isfinite(timestamp) or timestamp < 0:
@@ -254,6 +293,62 @@ class VideoMemory:
             f"{question}"
         )
 
+    def save_snapshot(self, directory: str | Path) -> bool:
+        """Persist a readable, per-video mirror without affecting inference."""
+        target = Path(directory)
+        manifest_path = target / ".managed-records.json"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            previous_files: set[str] = set()
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                candidates = manifest.get("record_files", [])
+                if not isinstance(candidates, list):
+                    raise ValueError("Snapshot manifest record_files must be a list")
+                for filename in candidates:
+                    if (
+                        isinstance(filename, str)
+                        and filename.endswith(".md")
+                        and NAME_RE.fullmatch(filename[:-3])
+                    ):
+                        previous_files.add(filename)
+            for candidate in target.glob("*.md"):
+                filename = candidate.name
+                if filename != "MEMORY.md" and NAME_RE.fullmatch(candidate.stem):
+                    previous_files.add(filename)
+
+            record_files = {f"{record.name}.md" for record in self.records.values()}
+            for record in self.records.values():
+                _atomic_write_text(target / f"{record.name}.md", _record_markdown(record))
+
+            index = self.memory_index()
+            index_body = index if index else "_No retained memory records._"
+            _atomic_write_text(target / "MEMORY.md", f"# Video memory\n\n{index_body}\n")
+
+            for filename in previous_files - record_files:
+                (target / filename).unlink(missing_ok=True)
+
+            manifest = {"record_files": sorted(record_files)}
+            _atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            )
+            snapshot_usage = {
+                **self.usage(),
+                "last_observation_time": self.last_time,
+                "record_files": sorted(record_files),
+            }
+            _atomic_write_text(
+                target / "usage.json",
+                json.dumps(snapshot_usage, ensure_ascii=False, indent=2) + "\n",
+            )
+            self.last_snapshot_error = None
+            return True
+        except Exception as exc:
+            self.snapshot_errors += 1
+            self.last_snapshot_error = str(exc)
+            return False
+
     def usage(self) -> dict[str, int | float]:
         payload = json.dumps(
             [asdict(record) for record in self.records.values()],
@@ -268,6 +363,7 @@ class VideoMemory:
             "write_errors": self.write_errors,
             "dropped_frames": self.dropped_frames,
             "write_seconds": self.write_seconds,
+            "snapshot_errors": self.snapshot_errors,
         }
 
 
@@ -322,6 +418,9 @@ class VideoMemorySession:
 
     def usage(self) -> dict[str, int | float]:
         return {**self.memory.usage(), "stream_errors": self._stream_errors}
+
+    def save_snapshot(self, directory: str | Path) -> bool:
+        return self.memory.save_snapshot(directory)
 
     def close(self) -> None:
         if self._closed:

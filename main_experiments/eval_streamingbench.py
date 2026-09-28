@@ -218,9 +218,16 @@ def run_benchmark(
                 continue
 
             memory_session = None
+            memory_snapshot_dir = None
+            memory_snapshot_rel = None
             if video_memory:
                 from lib.streaming_memory import VideoMemorySession
 
+                snapshot_stem = Path(video_basename).stem or "video"
+                memory_snapshot_rel = (
+                    Path("video_memory") / f"{video_index:04d}_{snapshot_stem}"
+                ).as_posix()
+                memory_snapshot_dir = Path(output_dir) / memory_snapshot_rel
                 memory_session = VideoMemorySession(
                     path=video_path,
                     fps=fps,
@@ -242,10 +249,14 @@ def run_benchmark(
                     int(math.ceil(window_seconds / max(float(chunk_duration), 1e-6))),
                 )
                 prompt = build_prompt(question)
+                memory_snapshot_saved = None
 
                 try:
                     if memory_session is not None:
                         memory_session.advance_to(ts_sec)
+                        memory_snapshot_saved = memory_session.save_snapshot(
+                            memory_snapshot_dir
+                        )
                         prompt = memory_session.augment(prompt)
                     result, decode_backend = query_recent_window(
                         qa=qa,
@@ -261,6 +272,13 @@ def run_benchmark(
                     pred = extract_mcq_answer(response)
                     answer_gt = extract_mcq_answer(str(question.get("answer", ""))) or str(question.get("answer", "")).strip().upper()
                     correct = bool(pred is not None and pred == answer_gt)
+                    memory_metadata = None
+                    if memory_session is not None:
+                        memory_metadata = {
+                            **memory_session.usage(),
+                            "snapshot_dir": memory_snapshot_rel,
+                            "snapshot_saved": memory_snapshot_saved,
+                        }
                     record = {
                         "_key": make_key(video_basename, question, question_limit=80),
                         "video": video_basename,
@@ -278,7 +296,7 @@ def run_benchmark(
                         "num_vision_tokens": result.num_vision_tokens,
                         "num_vision_tokens_before": result.num_vision_tokens_before,
                         "num_vision_tokens_after": result.num_vision_tokens_after,
-                        **({"memory": memory_session.usage()} if memory_session is not None else {}),
+                        **({"memory": memory_metadata} if memory_metadata is not None else {}),
                     }
                     logger.info(
                         "  [%d/%d] %s %s -> %s (gt=%s)",
@@ -290,6 +308,13 @@ def run_benchmark(
                         answer_gt,
                     )
                 except Exception as exc:
+                    memory_metadata = None
+                    if memory_session is not None:
+                        memory_metadata = {
+                            **memory_session.usage(),
+                            "snapshot_dir": memory_snapshot_rel,
+                            "snapshot_saved": memory_snapshot_saved,
+                        }
                     record = {
                         "_key": make_key(video_basename, question, question_limit=80),
                         "video": video_basename,
@@ -301,8 +326,21 @@ def run_benchmark(
                         "response": None,
                         "correct": False,
                         "error": str(exc),
+                        **({"memory": memory_metadata} if memory_metadata is not None else {}),
                     }
                     logger.error("  [%d/%d] %s failed: %s", processed, total_questions, question["time_stamp"], exc)
+
+                if memory_session is not None:
+                    memory_stats = memory_session.usage()
+                    logger.info(
+                        "    memory: records=%d writes=%d write_errors=%d "
+                        "stream_errors=%d snapshot=%s",
+                        memory_stats["record_count"],
+                        memory_stats["write_calls"],
+                        memory_stats["write_errors"],
+                        memory_stats["stream_errors"],
+                        memory_snapshot_rel if memory_snapshot_saved else "failed",
+                    )
 
                 all_results.append(record)
                 done_keys.add(record["_key"])

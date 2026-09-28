@@ -191,6 +191,17 @@ class StreamingBenchMemoryIntegrationCheck(unittest.TestCase):
             )
             self.assertEqual(memory_result["results"][0]["memory"]["record_count"], 1)
             self.assertEqual(memory_result["results"][1]["memory"]["record_count"], 2)
+            self.assertTrue(memory_result["results"][0]["memory"]["snapshot_saved"])
+            snapshot_rel = memory_result["results"][1]["memory"]["snapshot_dir"]
+            snapshot_dir = memory_dir / snapshot_rel
+            self.assertTrue(snapshot_dir.is_dir())
+            snapshot_index = (snapshot_dir / "MEMORY.md").read_text()
+            self.assertIn("access-code.md", snapshot_index)
+            self.assertIn("door-state.md", snapshot_index)
+            snapshot_usage = json.loads((snapshot_dir / "usage.json").read_text())
+            self.assertEqual(snapshot_usage["record_count"], 2)
+            self.assertEqual(snapshot_usage["snapshot_errors"], 0)
+            self.assertFalse((baseline_dir / "video_memory").exists())
 
 
 if __name__ == "__main__":

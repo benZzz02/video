@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from lib.streaming_memory import (
     WRITER_TOKENS,
@@ -136,6 +137,108 @@ class VideoMemoryCheck(unittest.TestCase):
         self.assertEqual(memory.usage()["pending_frames"], 0)
         self.assertEqual(memory.usage()["write_calls"], 3)
         self.assertEqual(memory.usage()["write_errors"], 1)
+
+    def test_snapshot_writes_readable_files_and_removes_merged_topic(self):
+        outputs = iter(
+            [
+                response(
+                    upsert(
+                        "object-color",
+                        "The object appears red at 0s.",
+                        "fact",
+                        "[0s] The visible object appears red.",
+                    )
+                ),
+                response(
+                    {"op": "delete", "name": "object-color"},
+                    upsert(
+                        "object-description",
+                        "The red object is identified as a ball by 1s.",
+                        "fact",
+                        "[0s] The object appears red. [1s] It is a ball.",
+                    ),
+                ),
+            ]
+        )
+        memory = VideoMemory(lambda *_: next(outputs), segment_frames=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "memory"
+            memory.observe(0, image())
+            self.assertTrue(memory.save_snapshot(target))
+            self.assertIn("object-color.md", (target / "MEMORY.md").read_text())
+            self.assertIn(
+                'description: "The object appears red at 0s."',
+                (target / "object-color.md").read_text(),
+            )
+
+            memory.observe(1, image())
+            self.assertTrue(memory.save_snapshot(target))
+            self.assertFalse((target / "object-color.md").exists())
+            self.assertTrue((target / "object-description.md").exists())
+            index = (target / "MEMORY.md").read_text()
+            self.assertNotIn("object-color.md", index)
+            self.assertIn("object-description.md", index)
+            usage = json.loads((target / "usage.json").read_text())
+            self.assertEqual(usage["record_count"], 1)
+            self.assertEqual(usage["record_files"], ["object-description.md"])
+            self.assertEqual(usage["snapshot_errors"], 0)
+            self.assertFalse(any(target.glob(".*.tmp")))
+
+    def test_snapshot_failure_does_not_raise_or_change_memory(self):
+        memory = VideoMemory(
+            lambda *_: response(
+                upsert("event", "An event occurs at 0s.", "fact", "[0s] Event.")
+            ),
+            segment_frames=1,
+        )
+        memory.observe(0, image())
+        original = dict(memory.records)
+        with tempfile.TemporaryDirectory() as directory:
+            blocked = Path(directory) / "not-a-directory"
+            blocked.write_text("file")
+            self.assertFalse(memory.save_snapshot(blocked))
+        self.assertEqual(memory.records, original)
+        self.assertEqual(memory.usage()["snapshot_errors"], 1)
+
+    def test_snapshot_recovers_and_cleans_orphan_after_partial_failure(self):
+        outputs = iter(
+            [
+                response(
+                    upsert(
+                        "old-topic",
+                        "An old topic is visible at 0s.",
+                        "fact",
+                        "[0s] Old topic.",
+                    )
+                ),
+                response({"op": "delete", "name": "old-topic"}),
+            ]
+        )
+        memory = VideoMemory(lambda *_: next(outputs), segment_frames=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "memory"
+            memory.observe(0, image())
+            from lib import streaming_memory
+
+            original_write = streaming_memory._atomic_write_text
+
+            def fail_index(path, text):
+                if path.name == "MEMORY.md":
+                    raise OSError("injected index failure")
+                return original_write(path, text)
+
+            with patch("lib.streaming_memory._atomic_write_text", side_effect=fail_index):
+                self.assertFalse(memory.save_snapshot(target))
+            self.assertTrue((target / "old-topic.md").exists())
+
+            memory.observe(1, image())
+            self.assertTrue(memory.save_snapshot(target))
+            self.assertFalse((target / "old-topic.md").exists())
+            self.assertIn(
+                "No retained memory records", (target / "MEMORY.md").read_text()
+            )
 
     def test_repeated_writer_failures_keep_a_bounded_retry_buffer(self):
         memory = VideoMemory(lambda *_: "not json", segment_frames=2)

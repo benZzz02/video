@@ -81,6 +81,33 @@ Thus frames waiting for the next memory update remain covered by the original
 recent window. Memory runs require a fresh output directory because v1 does not
 persist the store or stream cursor in the JSONL checkpoint.
 
+## Inspect local memory
+
+No extra flag is needed. While `--video-memory` is active, the latest memory
+for every video is mirrored after each question:
+
+```text
+<output-dir>/video_memory/0001_<video-name>/
+├── MEMORY.md
+├── <semantic-topic>.md
+├── ...
+└── usage.json
+```
+
+`MEMORY.md` is the readable topic index. Each topic file contains `name`,
+`description`, and `type` frontmatter followed by timestamped evidence.
+`usage.json` reports record count, writer/stream errors, dropped frames, and
+the managed topic filenames. Deleted or safely merged records are removed from
+the mirror. The snapshot directory is program-managed; keep personal Markdown
+notes elsewhere. Snapshot writes use atomic file replacement and are fail-open:
+a local I/O error increments `snapshot_errors` but does not stop inference.
+
+Every result also contains `memory.snapshot_dir` and
+`memory.snapshot_saved`. A successful question with `record_count > 0` and
+`snapshot_saved: true` therefore used a memory prefix and refreshed the local
+mirror successfully. The directory is a live latest-state view, so later
+questions from the same video update it in place.
+
 ## Run and check
 
 Add the flag to the original StreamingBench command:
