@@ -189,6 +189,7 @@ def run_benchmark(
         model_name=qa_model,
         device=qa_device,
         max_new_tokens=max_qa_tokens,
+        **({"standard_multimodal": True} if folio_memory else {}),
     )
 
     memory_segment_frames = None
@@ -522,6 +523,7 @@ def run_benchmark(
                 "cache_enabled": folio_config.cache_replay,
                 "feature_cache_enabled": False,
                 "folio_memory": True,
+                "folio_standard_multimodal": True,
                 "memory_protocol": "folio-paper-reimplementation-v1",
                 "folio_profile": folio_profile,
                 "folio_segment_seconds": float(folio_segment_seconds),

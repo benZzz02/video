@@ -890,6 +890,10 @@ class FolioMemory:
         incoming_distinctive = _distinctive(
             [record["name"], *record["aliases"], *record["attributes"]]
         )
+        name_counts: dict[str, int] = {}
+        for entity in entities.values():
+            for name in {_normalize(entity.canonical_name), *(_normalize(item) for item in entity.aliases)}:
+                name_counts[name] = name_counts.get(name, 0) + 1
         candidates: list[tuple[float, float, str]] = []
         for entity in entities.values():
             names = {_normalize(entity.canonical_name), *(_normalize(item) for item in entity.aliases)}
@@ -900,9 +904,20 @@ class FolioMemory:
             )
             score = 0.0
             winner = ""
+            shared_names = incoming_names & names
+            generic_identity_terms = GENERIC_NAMES | {
+                _head(record["name"]), _head(entity.canonical_name), incoming_category, category,
+            }
+            canonical_names = {_normalize(record["name"]), _normalize(entity.canonical_name)}
+            shared_names = {
+                name for name in shared_names
+                if name_counts.get(name, 0) == 1
+                and name not in GENERIC_NAMES
+                and (name in canonical_names or name not in generic_identity_terms)
+            }
             if _normalize(record["name"]) == _normalize(entity.canonical_name):
                 score, winner = 1.0, "name"
-            elif incoming_names & names:
+            elif shared_names:
                 score, winner = 0.95, "alias"
             elif _head(record["name"]) and _head(record["name"]) == _head(entity.canonical_name):
                 score, winner = 0.80, "head"
@@ -913,7 +928,7 @@ class FolioMemory:
             if score < 0.80:
                 continue
             if (
-                winner in {"head", "substring", "category"}
+                winner in {"alias", "head", "substring", "category"}
                 and incoming_distinctive
                 and old_distinctive
                 and not (incoming_distinctive & old_distinctive)
@@ -921,7 +936,7 @@ class FolioMemory:
                 continue
             if _head(record["name"]) in GENERIC_NAMES and score < 0.95 and not incoming_distinctive:
                 continue
-            if entity.id in claimed and score < 0.95:
+            if entity.id in claimed and winner != "name":
                 continue
             temporal_consistency = 1.0 / (1.0 + max(0, self.segment_index - entity.last_seen_segment))
             candidates.append((score, temporal_consistency, entity.id))
@@ -1099,6 +1114,9 @@ class FolioMemory:
                         previous.evidence_frame_ids.append(frame_id)
             elif previous and previous_segment == segment_id - 1 and self._same_observation(previous, observation):
                 previous.end_time = observation.end_time
+                if observation.detail == "detailed":
+                    previous.detail = "detailed"
+                previous.confidence = max(previous.confidence, observation.confidence)
                 for frame_id in linked:
                     if frame_id not in previous.evidence_frame_ids:
                         previous.evidence_frame_ids.append(frame_id)
@@ -1139,11 +1157,14 @@ class FolioMemory:
             ]
             linked = [evidence_ids[index] for index in raw["evidence_frames"]]
             if not linked:
-                for entity_id in participant_ids:
+                for entity_id in dict.fromkeys([*participant_ids, *changed_ids]):
                     entity = entities[entity_id]
                     latest = self._latest(entity)
-                    if latest and latest.segment_id == segment_id:
-                        linked.extend(latest.evidence_frame_ids)
+                    if latest and entity.last_seen_segment == segment_id:
+                        linked.extend(
+                            frame_id for frame_id in latest.evidence_frame_ids
+                            if evidence[frame_id].segment_id == segment_id
+                        )
                 linked = list(dict.fromkeys(linked))
             event = FolioEvent(
                 id=event_id,
@@ -1302,12 +1323,17 @@ class FolioMemory:
             query_type, scope = "attribute", "historical" if is_historical else "mixed"
         elif query_tokens & {"left", "right", "inside", "beside", "near", "under", "above", "behind", "front"}:
             query_type, scope = "spatial", "historical" if is_historical else "mixed"
+        elif (
+            query_tokens & {"profession", "occupation", "personality", "habit", "hobby", "lifestyle", "imply", "implies", "suggest", "suggests"}
+            or ("description" in query_tokens and query_tokens & {"fits", "fit"})
+        ):
+            query_type, scope = "concept", "mixed"
         elif set(raw_tokens) & ACTION_TERMS:
             query_type, scope = "interaction", "historical"
         elif question_norm.startswith(("is ", "was ", "did ", "does ", "has ", "have ")):
             query_type, scope = "yes/no", "mixed"
         else:
-            query_type, scope = "concept", "mixed"
+            query_type, scope = "attribute", "historical" if is_historical else "mixed"
         normalized_hint = _normalize(query_type_hint or "").replace(" ", "-")
         hint_aliases = {
             "hld": "hallucination-detection",
@@ -1617,6 +1643,7 @@ class FolioMemory:
                 header_lines.append(f"LLM-SUGGESTED OPTION: {suggested_option}")
         candidate_records: list[SelectedRecord] = []
         packable_records: list[SelectedRecord] = []
+        record_limits: dict[str, int] = {}
         entity_headers: dict[str, str] = {}
         explicit_events = [item for item in event_ids if item in self.events]
         related_events: list[str] = []
@@ -1645,13 +1672,15 @@ class FolioMemory:
                     or item[1].visible_text
                     or item[1].state
                     or item[1].evidence_summary
-                ][-6:]
+                ]
+                record_limits[entity_id] = 6
             elif intent.query_type == "spatial":
                 indexed_observations = [
                     item for item in indexed_observations if item[1].relations
-                ][-8:]
+                ]
+                record_limits[entity_id] = 8
             elif intent.query_type in {"yes/no", "hallucination-detection"}:
-                if indexed_observations:
+                if indexed_observations and intent.temporal_relation == "none":
                     indexed_observations = list(
                         dict.fromkeys(
                             [indexed_observations[0][0], indexed_observations[-1][0]]
@@ -1661,8 +1690,9 @@ class FolioMemory:
                         (index, entity.observations[index])
                         for index in indexed_observations
                     ]
+                record_limits[entity_id] = 2
             else:
-                indexed_observations = indexed_observations[-6:]
+                record_limits[entity_id] = 6
             packable_indices = {index for index, _ in indexed_observations}
             for observation_index, observation in all_indexed_observations:
                 observation_text = self._observation_line(observation)
@@ -1677,7 +1707,7 @@ class FolioMemory:
                 elif intent.query_type == "attribute":
                     grounding_text = " ".join(
                         [
-                            *entity.attributes,
+                            *(entity.attributes if intent.temporal_relation == "none" else []),
                             observation.visible_text,
                             observation.state,
                             observation.evidence_summary,
@@ -1786,7 +1816,26 @@ class FolioMemory:
             candidate_records.append(record)
             packable_records.append(record)
 
-        ranked_records = self._rank_cache_records(packable_records, intent)
+        # Apply time cues to the complete chain before imposing per-entity limits.
+        eligible_ids = {record.identifier for record in packable_records}
+        if intent.temporal_relation == "none":
+            for entity_id, limit in record_limits.items():
+                entity_records = [
+                    record for record in packable_records
+                    if record.kind == "observation" and record.entity_id == entity_id
+                ]
+                eligible_ids.difference_update(record.identifier for record in entity_records[:-limit])
+        ranked_records = []
+        record_counts: dict[str, int] = {}
+        for record in self._rank_cache_records(candidate_records, intent):
+            if record.identifier not in eligible_ids:
+                continue
+            if record.kind == "observation" and record.entity_id in record_limits:
+                count = record_counts.get(record.entity_id, 0)
+                if count >= record_limits[record.entity_id]:
+                    continue
+                record_counts[record.entity_id] = count + 1
+            ranked_records.append(record)
         first_by_entity: list[SelectedRecord] = []
         seen_entities: set[str] = set()
         for record in ranked_records:
@@ -1848,7 +1897,7 @@ class FolioMemory:
         if len(text.encode("utf-8")) > budget:
             raise AssertionError("FOLIO memory packer exceeded its byte budget")
         packed_records = [
-            record for record in packable_records if record.identifier in chosen_ids
+            record for record in ranked_records if record.identifier in chosen_ids
         ]
         packed_event_ids = [
             event_id
@@ -1861,6 +1910,8 @@ class FolioMemory:
         self,
         records: Sequence[SelectedRecord],
         intent: QueryIntent,
+        *,
+        temporal_only: bool = False,
     ) -> list[SelectedRecord]:
         cue_priority: dict[str, float] = {}
         observations_by_entity: dict[str, list[SelectedRecord]] = {}
@@ -1936,7 +1987,7 @@ class FolioMemory:
             )
 
         return sorted(
-            records,
+            [record for record in records if not temporal_only or record.identifier in cue_priority],
             key=lambda item: (
                 -cue_priority.get(item.identifier, 0.0),
                 -item.score,
@@ -1968,7 +2019,10 @@ class FolioMemory:
                 and self.evidence[frame_id].timestamp <= query_time
                 and self.evidence[frame_id].timestamp < recent_start
             ]
-            linked.sort(key=lambda item: (item.timestamp, item.id), reverse=True)
+            linked.sort(
+                key=lambda item: (item.timestamp, item.id),
+                reverse=intent.temporal_relation not in {"first", "after"},
+            )
             for frame in linked:
                 seen.add(frame.id)
                 chosen.append(frame)
@@ -2092,13 +2146,18 @@ class FolioMemory:
             selected_event_ids,
             question,
             options,
-            concept=retrieval_mode == "semlink",
+            concept=retrieval_mode == "semlink" and intent.query_type == "concept",
             suggested_option=suggested_option,
             entity_scores=entity_score_map,
         )
-        best_grounding_score = max(
-            (item.grounding_score for item in selected_records), default=0.0
-        )
+        grounding_records = selected_records
+        if intent.temporal_relation != "none":
+            packed_ids = {item.identifier for item in selected_records}
+            grounding_records = [
+                item for item in self._rank_cache_records(candidate_records, intent, temporal_only=True)
+                if item.identifier in packed_ids
+            ]
+        best_grounding_score = max((item.grounding_score for item in grounding_records), default=0.0)
         should_recover = bool(
             candidate_records
             and (
@@ -2140,7 +2199,7 @@ class FolioMemory:
                 "history_timestamps": json.dumps(history_times),
                 "concept_header": (
                     "Conceptual catalog linking was used; indirect evidence may support the answer."
-                    if retrieval_mode == "semlink"
+                    if retrieval_mode == "semlink" and intent.query_type == "concept"
                     else "Use direct factual evidence."
                 ),
                 "memory_text": memory_text,

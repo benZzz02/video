@@ -1238,6 +1238,166 @@ class FolioMemoryContract(unittest.TestCase):
                 recent_start=0.0,
             )
 
+    def test_shared_generic_alias_does_not_merge_distinct_cups(self):
+        red = detailed_object("red mug", category="container", location="counter", state="empty")
+        blue = detailed_object("blue mug", category="container", location="sink", state="full")
+        red.update(aliases=["cup"], attributes=["red"])
+        blue.update(aliases=["cup"], attributes=["blue"])
+        memory = FolioMemory(
+            ScriptedGenerate([
+                writer_response("0.0-1.0s", detailed=[red]),
+                writer_response("2.0-3.0s", detailed=[blue]),
+            ]),
+            segment_frames=2,
+            change_threshold=1.0,
+        )
+        observe_segment(memory, 0, [0, 1])
+        observe_segment(memory, 2, [2, 3])
+        self.assertEqual(len(memory.entities), 2)
+        self.assertEqual(
+            {entity.canonical_name: len(entity.observations) for entity in memory.entities.values()},
+            {"red mug": 1, "blue mug": 1},
+        )
+
+        red["aliases"] = ["coffee mug"]
+        renamed = detailed_object("coffee mug", category="container", location="sink", state="full")
+        renamed.update(aliases=["red mug"], attributes=["red"])
+        memory = FolioMemory(
+            ScriptedGenerate([
+                writer_response("0.0-1.0s", detailed=[red]),
+                writer_response("2.0-3.0s", detailed=[renamed]),
+            ]),
+            segment_frames=2,
+            change_threshold=1.0,
+        )
+        observe_segment(memory, 0, [0, 1])
+        observe_segment(memory, 2, [2, 3])
+        self.assertEqual(len(memory.entities), 1)
+        self.assertEqual(len(next(iter(memory.entities.values())).observations), 2)
+
+        for canonical, alias in (("bicycle", "bike"), ("sofa", "couch"), ("refrigerator", "fridge")):
+            with self.subTest(canonical=canonical, alias=alias):
+                original = detailed_object(canonical, category=canonical, location="left", state="visible")
+                original["aliases"] = [alias]
+                renamed = detailed_object(alias, category=canonical, location="right", state="visible")
+                memory = FolioMemory(
+                    ScriptedGenerate([
+                        writer_response("0.0-1.0s", detailed=[original]),
+                        writer_response("2.0-3.0s", detailed=[renamed]),
+                    ]),
+                    segment_frames=2,
+                )
+                observe_segment(memory, 0, [0, 1])
+                observe_segment(memory, 2, [2, 3])
+                self.assertEqual(len(memory.entities), 1)
+                self.assertEqual(len(next(iter(memory.entities.values())).observations), 2)
+
+    def test_temporal_attribute_and_spatial_targets_survive_recent_record_limits(self):
+        for kind in ("attribute", "spatial"):
+            for relation in ("first", "before", "after"):
+                for weak in (False, True):
+                    with self.subTest(kind=kind, relation=relation, weak=weak):
+                        target = {"first": 0, "before": 1, "after": 2}[relation]
+                        anchor = 2 if relation == "before" else 1
+                        name = "street sign" if kind == "attribute" else "red mug"
+                        outputs = []
+                        for index in range(12):
+                            item = detailed_object(
+                                name,
+                                category="sign" if kind == "attribute" else "container",
+                                location="roadside" if kind == "attribute" else "counter",
+                                state="checkpoint" if index == anchor else f"view {index}",
+                                state_change=f"view {index}",
+                            )
+                            item["evidence_summary"] = ""
+                            if kind == "attribute":
+                                item["visible_text"] = "" if weak and index == target else (
+                                    "STOP" if index == target else "YIELD"
+                                )
+                            else:
+                                item["relations"] = [] if weak and index == target else [
+                                    {"relation": "left" if index == target else "right", "target": "plate"}
+                                ]
+                            outputs.append(writer_response(f"{2 * index}.0-{2 * index + 1}.0s", detailed=[item]))
+                        memory = FolioMemory(
+                            ScriptedGenerate(outputs),
+                            config=FolioConfig(segment_frames=2, change_threshold=1.0, max_cache_frames_per_query=1),
+                        )
+                        for index in range(12):
+                            observe_segment(memory, 2 * index, [2 * index, 2 * index + 1])
+                        cue = "first" if relation == "first" else f"{relation} the checkpoint"
+                        question = (
+                            f"What text was on the street sign {cue}?" if kind == "attribute" else
+                            f"Was the red mug left or right of the plate {cue}?"
+                        )
+                        options = ["STOP", "YIELD", "SCHOOL", "Unknown"] if kind == "attribute" else [
+                            "Left", "Right", "Above", "Unknown"
+                        ]
+                        plan = memory.prepare_query("q-temporal", question, options, query_time=24.0, recent_start=24.0)
+                        self.assertEqual(plan.query_type, kind)
+                        if weak:
+                            # Strong recent distractors cannot substitute for the requested time's missing slot.
+                            self.assertEqual(plan.evidence_timestamps, (float(2 * target),))
+                        else:
+                            selected = [record for record in plan.selected_records if record.observation_index == target]
+                            self.assertTrue(selected)
+                            self.assertIn("STOP" if kind == "attribute" else "left", selected[0].field_text)
+
+    def test_semlink_keeps_hld_strict_but_allows_actual_concept_inference(self):
+        generate = ScriptedGenerate([
+            writer_response("0.0-1.0s", detailed=[
+                detailed_object("bookshelf", category="furniture", location="study wall", state="filled with books")
+            ])
+        ])
+        memory = FolioMemory(generate, segment_frames=2, change_threshold=1.0)
+        observe_segment(memory, 0, [0, 1])
+        entity_id = next(iter(memory.entities))
+        generate.semlink_output = json.dumps({"relevant_object_ids": [entity_id], "suggested_option": "A"})
+        hld = memory.prepare_query(
+            "q-hld-semlink", "Where was the bicycle seat before I opened it?",
+            ["On the bicycle", "On the floor", "In the garage", "Unable to answer"],
+            query_time=2.0, recent_start=2.0, query_type_hint="HLD",
+        )
+        self.assertEqual(hld.direct_scores, ())
+        self.assertEqual(hld.retrieval_mode, "semlink")
+        self.assertEqual(hld.query_type, "hallucination-detection")
+        self.assertNotIn("CONCEPT QUESTION", hld.memory_text)
+        self.assertNotIn("LLM-SUGGESTED OPTION", hld.memory_text)
+        concept = memory.prepare_query(
+            "q-concept-semlink", "Which description best fits this person?",
+            ["Avid reader", "Musician", "Athlete", "Unable to answer"],
+            query_time=2.0, recent_start=2.0,
+        )
+        self.assertEqual(concept.retrieval_mode, "semlink")
+        self.assertEqual(concept.query_type, "concept")
+        self.assertIn("CONCEPT QUESTION", concept.memory_text)
+        self.assertIn("LLM-SUGGESTED OPTION", concept.memory_text)
+
+    def test_compressed_observation_updates_quality_and_current_event_frames(self):
+        brief = "red mug rests on counter"
+        compact = {"name": "red mug", "category": "container", "location": "counter", "state": "empty",
+                   "brief": brief, "confidence": 0.3, "evidence_frames": [0]}
+        outputs = [writer_response("0.0-1.0s", compact=[compact])]
+        for index, confidence in ((1, 0.95), (2, 0.99)):
+            item = detailed_object("red mug", category="container", location="counter", state="empty", state_change="stable")
+            item.update(holder="", evidence_summary=brief, confidence=confidence)
+            outputs.append(writer_response(f"{2 * index}.0-{2 * index + 1}.0s", detailed=[item], events=[
+                event("touch", "The red mug was touched.", ["red mug"], [])
+            ]))
+        memory = FolioMemory(ScriptedGenerate(outputs), segment_frames=2, change_threshold=1.0)
+        for index in range(3):
+            observe_segment(memory, 2 * index, [2 * index, 2 * index + 1])
+        observation = next(iter(memory.entities.values())).observations
+        self.assertEqual(len(observation), 1)
+        self.assertEqual((observation[0].start_time, observation[0].end_time), (0.0, 5.0))
+        self.assertEqual(observation[0].detail, "detailed")
+        self.assertEqual(observation[0].confidence, 0.99)
+        for item in memory.events.values():
+            self.assertTrue(item.evidence_frame_ids)
+            frames = [memory.evidence[frame_id] for frame_id in item.evidence_frame_ids]
+            self.assertTrue(all(frame.segment_id == item.segment_id for frame in frames))
+            self.assertTrue(all(item.start_time <= frame.timestamp <= item.end_time for frame in frames))
+
 
 if __name__ == "__main__":
     unittest.main()

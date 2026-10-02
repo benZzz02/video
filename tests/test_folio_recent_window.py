@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from unittest.mock import patch
 
@@ -8,7 +9,12 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 if TORCH_AVAILABLE:
     import torch
 
-    from lib.recent_window_eval import EvalChunk, RecentWindowQAModel, query_recent_window
+    from lib.recent_window_eval import (
+        EvalChunk,
+        RecentWindowQAModel,
+        extract_mcq_answer,
+        query_recent_window,
+    )
 
 
 def frame(value: int) -> Image.Image:
@@ -17,6 +23,68 @@ def frame(value: int) -> Image.Image:
 
 @unittest.skipUnless(TORCH_AVAILABLE, "requires torch")
 class FolioRecentWindowCheck(unittest.TestCase):
+    def test_structured_answer_uses_label_instead_of_reason(self):
+        value = json.dumps({"reason": "There is a bookshelf.", "prediction_label": "B"})
+        self.assertEqual(extract_mcq_answer(value), "B")
+        self.assertEqual(extract_mcq_answer(f"Here is my answer:\n```json\n{value}\n```"), "B")
+        self.assertEqual(extract_mcq_answer('{"prediction_label": " d "}'), "D")
+
+    def test_invalid_structured_answer_does_not_guess_from_evidence(self):
+        for label in ("E", "A or B", "", None, 2, ["B"]):
+            with self.subTest(label=label):
+                value = json.dumps({"reason": "There is a bookshelf.", "prediction_label": label})
+                self.assertIsNone(extract_mcq_answer(value))
+        self.assertIsNone(extract_mcq_answer('{"reason": "There is a bookshelf."}'))
+        self.assertIsNone(extract_mcq_answer('{"prediction_label": "B", "reason": "A"'))
+
+    def test_bare_answer_and_ground_truth_formats_still_work(self):
+        for text, expected in (("A", "A"), (" b ", "B"), ("Answer: C", "C"), ("4", "D")):
+            with self.subTest(text=text):
+                self.assertEqual(extract_mcq_answer(text), expected)
+        self.assertIsNone(extract_mcq_answer(None))
+
+    def test_standard_multimodal_preserves_images_and_uses_native_inputs(self):
+        images = [frame(10), frame(20)]
+
+        class Processor:
+            def apply_chat_template(self, messages, **kwargs):
+                self.messages = messages
+                self.kwargs = kwargs
+                # One image block per input frame, as produced by Qwen's template.
+                return {
+                    "input_ids": torch.tensor([[1, 7, 9, 8, 7, 9, 8, 2]]),
+                    "attention_mask": torch.ones((1, 8), dtype=torch.long),
+                    "pixel_values": torch.ones((2, 3)),
+                    "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]]),
+                }
+
+        qa = object.__new__(RecentWindowQAModel)
+        qa.standard_multimodal = True
+        qa.processor = Processor()
+        qa.image_token_id = 9
+        qa._get_text_input_device = lambda: torch.device("cpu")
+        qa._get_visual_device = lambda: torch.device("cpu")
+        qa.encode_vision = lambda _frames: self.fail("native mode must not use the cached prefix")
+        captured = {}
+
+        def generate(**kwargs):
+            captured.update(kwargs)
+            return "B"
+
+        qa._generate_from_model_inputs = generate
+        self.assertEqual(qa.generate_from_frames(images, "Which object?"), "B")
+        content = qa.processor.messages[0]["content"]
+        self.assertEqual([item["image"] for item in content[:-1]], images)
+        self.assertEqual(content[-1], {"type": "text", "text": "Which object?"})
+        self.assertTrue(qa.processor.kwargs["add_generation_prompt"])
+        self.assertEqual(int((captured["input_ids"] == 7).sum()), 2)
+        self.assertIn("pixel_values", captured)
+        self.assertIn("image_grid_thw", captured)
+        self.assertNotIn("inputs_embeds", captured)
+        self.assertEqual(captured["prompt_length"], 8)
+        self.assertEqual(qa._last_num_vision_tokens, 2)
+        self.assertEqual(qa._last_num_vision_frames, 2)
+
     def test_text_only_generation_builds_no_visual_input(self):
         class Processor:
             def apply_chat_template(self, messages, **kwargs):

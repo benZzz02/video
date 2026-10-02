@@ -96,9 +96,11 @@ class StreamingBenchFolioIntegrationCheck(unittest.TestCase):
         semlink_prompts: list[str] = []
         query_calls: list[dict] = []
         source_calls: list[tuple[str, float]] = []
+        model_configs: list[dict] = []
 
         class FakeQA:
             def __init__(self, **kwargs):
+                model_configs.append(kwargs)
                 self.max_new_tokens = kwargs["max_new_tokens"]
 
             def generate_from_frames(self, frames, prompt):
@@ -196,6 +198,8 @@ class StreamingBenchFolioIntegrationCheck(unittest.TestCase):
 
             self.assertEqual(len(baseline_calls), 2)
             self.assertEqual(len(folio_calls), 2)
+            self.assertNotIn("standard_multimodal", model_configs[0])
+            self.assertTrue(model_configs[1]["standard_multimodal"])
             baseline_query_keys = {
                 "qa",
                 "video_path",
@@ -314,6 +318,7 @@ class StreamingBenchFolioIntegrationCheck(unittest.TestCase):
                 "cache_enabled": True,
                 "feature_cache_enabled": False,
                 "folio_memory": True,
+                "folio_standard_multimodal": True,
                 "memory_protocol": "folio-paper-reimplementation-v1",
                 "folio_profile": "full",
                 "folio_segment_seconds": 8.0,

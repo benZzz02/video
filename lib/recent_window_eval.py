@@ -74,6 +74,7 @@ class RecentWindowQAModel:
         device: str | torch.device = "auto",
         max_new_tokens: int = 256,
         attn_implementation: str = "flash_attention_2",
+        standard_multimodal: bool = False,
     ) -> None:
         from transformers import AutoProcessor
 
@@ -89,6 +90,7 @@ class RecentWindowQAModel:
         self.model_name = model_name
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
+        self.standard_multimodal = bool(standard_multimodal)
         self._last_ttft_seconds: float = 0.0
         self._last_num_vision_tokens: int = 0
         self._last_num_vision_frames: int = 0
@@ -307,7 +309,33 @@ class RecentWindowQAModel:
 
     @torch.inference_mode()
     def generate_from_frames(self, frames: list[Image.Image], question: str) -> str:
-        """Generate from frames via cached vision encoding and explicit prefix construction."""
+        """Use native multimodal generation when enabled, otherwise the cached prefix."""
+        if getattr(self, "standard_multimodal", False):
+            content = [{"type": "image", "image": frame} for frame in frames]
+            content.append({"type": "text", "text": question})
+            inputs = self.processor.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            text_device = self._get_text_input_device()
+            visual_device = self._get_visual_device()
+            inputs = {
+                key: value.to(
+                    visual_device if key in {"pixel_values", "image_grid_thw"} else text_device
+                )
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in inputs.items()
+            }
+            input_ids = inputs["input_ids"]
+            self._last_num_vision_tokens = int((input_ids == self.image_token_id).sum().item())
+            self._last_num_vision_frames = len(frames)
+            return self._generate_from_model_inputs(
+                prompt_length=int(input_ids.shape[1]), **inputs
+            )
         cached_embeds, cached_grid_thw = self.encode_vision(frames)
         return self.generate_with_cached_vision(cached_embeds, cached_grid_thw, question)
 
@@ -356,7 +384,20 @@ def build_ovo_prompt(task: str, anno: dict[str, Any], index: int = 0) -> str:
 def extract_mcq_answer(response: str | None) -> str | None:
     if response is None or not str(response).strip():
         return None
-    text = str(response).strip().upper()
+    text = str(response).strip()
+    fenced = re.search(r"```(?:json)?\s*([\{\[].*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    json_text = fenced.group(1).strip() if fenced else text
+    if json_text.startswith(("{", "[")):
+        try:
+            value = json.loads(json_text)
+        except json.JSONDecodeError:
+            return None
+        label = value.get("prediction_label") if isinstance(value, dict) else None
+        if not isinstance(label, str):
+            return None
+        label = label.strip().upper()
+        return label if label in {"A", "B", "C", "D"} else None
+    text = text.upper()
     match = re.search(r"\b([A-D])\b", text)
     if match:
         return match.group(1)
