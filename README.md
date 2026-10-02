@@ -174,6 +174,20 @@ Readable per-video snapshots are written under
 `<output-dir>/video_memory/<video>/` while the benchmark runs.
 [Usage and checks](docs/streaming_memory_v1.md).
 
+## FOLIO-inspired memory extension
+
+Add `--folio-memory --folio-profile full` to the StreamingBench command for an
+independent implementation of FOLIO's focused semantic memory. It keeps the
+original recent window, and adds eight-second adaptive keyframe writing,
+persistent entity/event chains, dynamic focus, structured retrieval, SemLink
+fallback, conditional historical-frame recovery, and causal dialogue history
+from prior model predictions. Per-video state, evidence images, and query
+traces are saved under `<output-dir>/folio_memory/`.
+
+FOLIO does not currently publish runtime source code or every numerical
+hyperparameter, so this mode is explicitly paper-based rather than an official
+reproduction. [Design, defaults, usage, and checks](docs/folio_memory.md).
+
 ## Contact
 
 If you have any questions about the paper, codebase, or experimental setup, please feel free to contact [shenyujiao18@gmail.com](mailto:shenyujiao18@gmail.com).

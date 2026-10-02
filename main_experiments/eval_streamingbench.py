@@ -5,6 +5,7 @@ By default, this script runs the recency baseline (`--top-k 0`):
 decode the time window ending at each question timestamp and answer from the
 most recent N chunks without feature cache or retrieval.
 Optional --video-memory adds bounded semantic records from earlier video frames.
+Optional --folio-memory adds entity/event chains and linked visual evidence.
 """
 
 from __future__ import annotations
@@ -144,7 +145,16 @@ def run_benchmark(
     recent_frames_only: int,
     context_time: int,
     video_memory: bool = False,
+    folio_memory: bool = False,
+    folio_profile: str = "full",
+    folio_segment_seconds: float = 8.0,
 ) -> None:
+    if video_memory and folio_memory:
+        raise ValueError("--video-memory and --folio-memory are mutually exclusive")
+    if folio_memory and (
+        not math.isfinite(folio_segment_seconds) or folio_segment_seconds <= 0
+    ):
+        raise ValueError("folio_segment_seconds must be positive and finite")
     if top_k != 0:
         raise ValueError(
             "This release script only supports the no-retrieval baseline. "
@@ -170,7 +180,8 @@ def run_benchmark(
 
     os.makedirs(output_dir, exist_ok=True)
     ckpt_path = os.path.join(output_dir, "results_incremental.jsonl")
-    if video_memory and os.path.exists(ckpt_path) and os.path.getsize(ckpt_path):
+    memory_enabled = video_memory or folio_memory
+    if memory_enabled and os.path.exists(ckpt_path) and os.path.getsize(ckpt_path):
         raise ValueError("Memory runs require a fresh output directory; stateful resume is unsupported.")
     all_results, done_keys = load_jsonl_results(ckpt_path)
 
@@ -188,12 +199,24 @@ def run_benchmark(
             else float(recent_frames_only) * float(chunk_duration)
         )
         memory_segment_frames = max(1, int(math.ceil(memory_window_seconds * float(fps))))
+    folio_config = None
+    if folio_memory:
+        from lib.folio_memory import FolioConfig
+
+        folio_segment_frames = max(
+            1, int(math.ceil(float(folio_segment_seconds) * float(fps)))
+        )
+        folio_config = FolioConfig.profile(
+            folio_profile, segment_frames=folio_segment_frames
+        )
 
     def generate_memory(images, text, limit):
         saved = qa.max_new_tokens
         try:
             qa.max_new_tokens = limit
-            return qa.generate_from_frames(images, text)
+            if images:
+                return qa.generate_from_frames(images, text)
+            return qa.generate_from_text(text)
         finally:
             qa.max_new_tokens = saved
 
@@ -220,6 +243,7 @@ def run_benchmark(
             memory_session = None
             memory_snapshot_dir = None
             memory_snapshot_rel = None
+            memory_kind = None
             if video_memory:
                 from lib.streaming_memory import VideoMemorySession
 
@@ -234,6 +258,22 @@ def run_benchmark(
                     generate=generate_memory,
                     segment_frames=memory_segment_frames,
                 )
+                memory_kind = "semantic"
+            elif folio_memory:
+                from lib.folio_memory import FolioMemorySession
+
+                snapshot_stem = Path(video_basename).stem or "video"
+                memory_snapshot_rel = (
+                    Path("folio_memory") / f"{video_index:04d}_{snapshot_stem}"
+                ).as_posix()
+                memory_snapshot_dir = Path(output_dir) / memory_snapshot_rel
+                memory_session = FolioMemorySession(
+                    path=video_path,
+                    fps=fps,
+                    generate=generate_memory,
+                    config=folio_config,
+                )
+                memory_kind = "folio"
 
             for question in questions:
                 processed += 1
@@ -250,15 +290,37 @@ def run_benchmark(
                 )
                 prompt = build_prompt(question)
                 memory_snapshot_saved = None
+                folio_plan = None
+                folio_history_frames_used = 0
 
                 try:
                     if memory_session is not None:
                         memory_session.advance_to(ts_sec)
-                        memory_snapshot_saved = memory_session.save_snapshot(
-                            memory_snapshot_dir
-                        )
-                        prompt = memory_session.augment(prompt)
-                    result, decode_backend = query_recent_window(
+                        if memory_kind == "semantic":
+                            memory_snapshot_saved = memory_session.save_snapshot(
+                                memory_snapshot_dir
+                            )
+                            prompt = memory_session.augment(prompt)
+                        else:
+                            try:
+                                folio_plan = memory_session.prepare_query(
+                                    make_key(video_basename, question, question_limit=80),
+                                    str(question.get("question", "")),
+                                    [str(item) for item in question.get("options", [])],
+                                    query_time=ts_sec,
+                                    recent_start=video_start,
+                                    original_prompt=prompt,
+                                    query_type_hint=str(question.get("task_type", "")),
+                                )
+                                prompt = folio_plan.prompt
+                            except Exception as memory_exc:
+                                memory_session.memory.query_errors += 1
+                                logger.warning(
+                                    "FOLIO retrieval failed open for %s: %s",
+                                    question["time_stamp"],
+                                    memory_exc,
+                                )
+                    query_kwargs = dict(
                         qa=qa,
                         video_path=video_path,
                         prompt=prompt,
@@ -268,16 +330,70 @@ def run_benchmark(
                         video_start=video_start,
                         video_end=ts_sec + 1e-4,
                     )
+                    if folio_plan is not None:
+                        query_kwargs["historical_frames"] = folio_plan.evidence_frames
+                        folio_history_frames_used = len(folio_plan.evidence_frames)
+                    try:
+                        result, decode_backend = query_recent_window(**query_kwargs)
+                    except Exception:
+                        if folio_plan is None or not folio_plan.evidence_frames:
+                            raise
+                        logger.warning(
+                            "FOLIO history-frame answer failed; retrying the unchanged recent window"
+                        )
+                        query_kwargs.pop("historical_frames", None)
+                        query_kwargs["prompt"] = folio_plan.recent_only_prompt
+                        folio_history_frames_used = 0
+                        result, decode_backend = query_recent_window(**query_kwargs)
                     response = result.answer
                     pred = extract_mcq_answer(response)
                     answer_gt = extract_mcq_answer(str(question.get("answer", ""))) or str(question.get("answer", "")).strip().upper()
                     correct = bool(pred is not None and pred == answer_gt)
+                    if folio_plan is not None:
+                        if memory_session.memory.query_traces:
+                            memory_session.memory.query_traces[-1][
+                                "historical_frames_used"
+                            ] = folio_history_frames_used
+                        memory_session.commit_interaction(
+                            folio_plan.query_id,
+                            folio_plan,
+                            str(question.get("question", "")),
+                            [str(item) for item in question.get("options", [])],
+                            predicted_label=pred or "",
+                            predicted_text=(
+                                str(question.get("options", [])[ord(pred) - ord("A")])
+                                if pred is not None
+                                and ord(pred) - ord("A") < len(question.get("options", []))
+                                else ""
+                            ),
+                        )
+                    if memory_kind == "folio" and memory_session is not None:
+                        memory_snapshot_saved = memory_session.save_snapshot(
+                            memory_snapshot_dir
+                        )
                     memory_metadata = None
                     if memory_session is not None:
                         memory_metadata = {
                             **memory_session.usage(),
                             "snapshot_dir": memory_snapshot_rel,
                             "snapshot_saved": memory_snapshot_saved,
+                            **(
+                                folio_plan.to_metadata()
+                                if folio_plan is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "historical_frame_count": folio_history_frames_used,
+                                    "recent_frame_count": max(
+                                        0,
+                                        int(result.num_frames)
+                                        - folio_history_frames_used,
+                                    ),
+                                }
+                                if folio_plan is not None
+                                else {}
+                            ),
                         }
                     record = {
                         "_key": make_key(video_basename, question, question_limit=80),
@@ -296,7 +412,13 @@ def run_benchmark(
                         "num_vision_tokens": result.num_vision_tokens,
                         "num_vision_tokens_before": result.num_vision_tokens_before,
                         "num_vision_tokens_after": result.num_vision_tokens_after,
-                        **({"memory": memory_metadata} if memory_metadata is not None else {}),
+                        **(
+                            {"folio": memory_metadata}
+                            if memory_kind == "folio" and memory_metadata is not None
+                            else {"memory": memory_metadata}
+                            if memory_metadata is not None
+                            else {}
+                        ),
                     }
                     logger.info(
                         "  [%d/%d] %s %s -> %s (gt=%s)",
@@ -308,12 +430,30 @@ def run_benchmark(
                         answer_gt,
                     )
                 except Exception as exc:
+                    if memory_kind == "folio" and memory_session is not None:
+                        if folio_plan is not None and memory_session.memory.query_traces:
+                            memory_session.memory.query_traces[-1][
+                                "historical_frames_used"
+                            ] = folio_history_frames_used
+                        memory_snapshot_saved = memory_session.save_snapshot(
+                            memory_snapshot_dir
+                        )
                     memory_metadata = None
                     if memory_session is not None:
                         memory_metadata = {
                             **memory_session.usage(),
                             "snapshot_dir": memory_snapshot_rel,
                             "snapshot_saved": memory_snapshot_saved,
+                            **(
+                                folio_plan.to_metadata()
+                                if folio_plan is not None
+                                else {}
+                            ),
+                            **(
+                                {"historical_frame_count": folio_history_frames_used}
+                                if folio_plan is not None
+                                else {}
+                            ),
                         }
                     record = {
                         "_key": make_key(video_basename, question, question_limit=80),
@@ -326,7 +466,13 @@ def run_benchmark(
                         "response": None,
                         "correct": False,
                         "error": str(exc),
-                        **({"memory": memory_metadata} if memory_metadata is not None else {}),
+                        **(
+                            {"folio": memory_metadata}
+                            if memory_kind == "folio" and memory_metadata is not None
+                            else {"memory": memory_metadata}
+                            if memory_metadata is not None
+                            else {}
+                        ),
                     }
                     logger.error("  [%d/%d] %s failed: %s", processed, total_questions, question["time_stamp"], exc)
 
@@ -370,6 +516,23 @@ def run_benchmark(
                 "memory_segment_frames": memory_segment_frames,
             }
         )
+    elif folio_memory:
+        config.update(
+            {
+                "cache_enabled": folio_config.cache_replay,
+                "feature_cache_enabled": False,
+                "folio_memory": True,
+                "memory_protocol": "folio-paper-reimplementation-v1",
+                "folio_profile": folio_profile,
+                "folio_segment_seconds": float(folio_segment_seconds),
+                "folio_segment_frames": folio_config.segment_frames,
+                "folio_semantic_expansion": folio_config.semantic_link,
+                "folio_evidence_cache": folio_config.cache_replay,
+                "folio_interaction_focus": folio_config.interaction_focus,
+                "folio_top_entities": folio_config.query_top_k,
+                "folio_max_evidence_frames": folio_config.max_cache_frames_per_query,
+            }
+        )
     save_json(
         os.path.join(output_dir, f"streaming_bench_results_{timestamp}.json"),
         {
@@ -396,7 +559,11 @@ def main() -> None:
     parser.add_argument("--max-qa-tokens", type=int, default=256)
     parser.add_argument("--recent-frames-only", "--recent-frames-buffer", dest="recent_frames_only", type=int, default=4)
     parser.add_argument("--context-time", type=int, default=-1)
-    parser.add_argument("--video-memory", action="store_true")
+    memory_group = parser.add_mutually_exclusive_group()
+    memory_group.add_argument("--video-memory", action="store_true")
+    memory_group.add_argument("--folio-memory", action="store_true")
+    parser.add_argument("--folio-profile", choices=("compat", "full"), default="full")
+    parser.add_argument("--folio-segment-seconds", type=float, default=8.0)
     args = parser.parse_args()
 
     if args.clip_model or args.clip_device:
@@ -412,6 +579,8 @@ def main() -> None:
             f"_recent{int(args.recent_frames_only)}"
             f"_chunk{str(args.chunk_duration).replace('.', 'p')}"
             f"_fps{str(args.fps).replace('.', 'p')}"
+            f"{'_folio_' + args.folio_profile if args.folio_memory else ''}"
+            f"{'_memory_v1' if args.video_memory else ''}"
             f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
         output_dir = str(root_dir / "eval" / "StreamingBench" / "results" / run_tag)
@@ -428,6 +597,9 @@ def main() -> None:
         recent_frames_only=args.recent_frames_only,
         context_time=args.context_time,
         video_memory=args.video_memory,
+        folio_memory=args.folio_memory,
+        folio_profile=args.folio_profile,
+        folio_segment_seconds=args.folio_segment_seconds,
     )
 
 

@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from PIL import Image
@@ -311,6 +311,33 @@ class RecentWindowQAModel:
         cached_embeds, cached_grid_thw = self.encode_vision(frames)
         return self.generate_with_cached_vision(cached_embeds, cached_grid_thw, question)
 
+    @torch.inference_mode()
+    def generate_from_text(self, text: str) -> str:
+        """Generate from text only for FOLIO's catalog-constrained SemLink call."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Text-only generation requires a nonempty prompt")
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": text}]}
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        input_ids = inputs["input_ids"].to(self._get_text_input_device())
+        attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids)).to(
+            input_ids.device
+        )
+        self._last_num_vision_tokens = 0
+        self._last_num_vision_frames = 0
+        return self._generate_from_model_inputs(
+            prompt_length=int(input_ids.shape[1]),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
 
 def build_ovo_prompt(task: str, anno: dict[str, Any], index: int = 0) -> str:
     if task in ALL_BR_TASKS:
@@ -542,6 +569,7 @@ def query_recent_window(
     recent_frames_only: int,
     video_start: float | None = None,
     video_end: float | None = None,
+    historical_frames: Sequence[Image.Image] = (),
 ) -> tuple[RecentWindowResult, str]:
     chunks, decode_backend = decode_video_to_chunks_qwen(
         video_path=video_path,
@@ -556,7 +584,7 @@ def query_recent_window(
 
     window_size = max(1, int(recent_frames_only))
     recent_chunks = list(chunks[-window_size:])
-    final_frames: list[Image.Image] = []
+    final_frames: list[Image.Image] = list(historical_frames)
     for chunk in recent_chunks:
         final_frames.extend(chunk.frames)
 

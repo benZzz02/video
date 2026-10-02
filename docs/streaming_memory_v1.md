@@ -71,8 +71,10 @@ The following behavior remains unchanged:
   frames whose timestamps are no later than the current question.
 - Questions from the same video share one store; another video starts with an
   empty store.
-- The three `recent_window_eval` implementations and both OVO entry points are
-  unchanged. OVO's independent prefix clips do not share this memory.
+- The optional FOLIO extension adds a default-empty historical-frame argument
+  to the shared `query_recent_window`; v1 never supplies it, so v1 frame
+  selection and generation remain unchanged. Both OVO entry points remain
+  independent and do not share this memory.
 - With the flag absent, the baseline result schema and inference calls are
   unchanged.
 
