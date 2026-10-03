@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -516,7 +517,16 @@ def decode_video_to_chunks_qwen(
         try:
             from qwen_vl_utils.vision_process import fetch_video
         except ImportError as exc:
-            raise RuntimeError("qwen_vl_utils is required for video decoding.") from exc
+            helper_site = os.environ.get("SIMPLESTREAM_QWEN_UTILS_SITE", "").strip()
+            if helper_site and helper_site not in sys.path:
+                # Keep the active Transformers environment first.  This allows
+                # reusing only a compatible qwen-vl-utils/decord installation
+                # from another local environment without mixing Transformers.
+                sys.path.append(helper_site)
+            try:
+                from qwen_vl_utils.vision_process import fetch_video
+            except ImportError as fallback_exc:
+                raise RuntimeError("qwen_vl_utils is required for video decoding.") from fallback_exc
 
     if chunk_duration <= 0:
         raise ValueError(f"chunk_duration must be > 0, got {chunk_duration}")

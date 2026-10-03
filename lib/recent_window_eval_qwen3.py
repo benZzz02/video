@@ -31,6 +31,10 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
     ) -> None:
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
+        attn_implementation = os.environ.get(
+            "SIMPLESTREAM_ATTN_IMPLEMENTATION", attn_implementation
+        )
+
         self.model_name = model_name
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
@@ -51,6 +55,17 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
         }
         if device == "auto":
             model_kwargs["device_map"] = "auto"
+        elif os.environ.get("SIMPLESTREAM_DIRECT_DEVICE_MAP", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            # Avoid a slow CPU->GPU copy after loading the full checkpoint.
+            # With one visible GPU per process, this keeps the model on the
+            # accelerator from the beginning while preserving the original
+            # single-device evaluation path.
+            model_kwargs["device_map"] = {"": str(device)}
 
         saved_world_size = os.environ.pop("WORLD_SIZE", None)
         try:
@@ -58,7 +73,7 @@ class RecentWindowQAModel(_BaseRecentWindowQAModel):
         finally:
             if saved_world_size is not None:
                 os.environ["WORLD_SIZE"] = saved_world_size
-        if device != "auto":
+        if device != "auto" and "device_map" not in model_kwargs:
             self.model.to(device)
         self.model.eval()
 
