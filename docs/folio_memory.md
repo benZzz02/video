@@ -181,11 +181,168 @@ frame count. This implementation uses:
 
 These are reproducible engineering defaults, not claimed FOLIO hyperparameters.
 
-## Scope
+## OVO shared memory and task routing
 
-The first release integrates StreamingBench. The OVO entry points operate on
-independent prefix clips rather than a verified shared source stream, so they
-are left unchanged to avoid mixing or replaying video state across clips.
+The original OVO baseline is unchanged. `eval_qwen3vl_ovo_folio.py` builds
+independent prefix memories; `eval_qwen3vl_ovo_folio_fast.py` groups annotations
+by their source `video`, opens the longest available causal prefix, and shares
+causal memory state across that video's questions in timestamp order. Under
+`task_state`, each required task memory has its own session.
+
+The fast runner defaults to `--folio_query_policy task_state`. Its routes are:
+
+| Tasks | `memory_route` | State and answer |
+| --- | --- | --- |
+| RT (OCR/ACR/ATR/STU/FPD/OJR), SSR | `recent_only` | Original OVO prompt and recent frames; no history writing or retrieval |
+| BT (EPM/ASI/HLD) | `text_memory` | Shared FOLIO historical text plus recent frames |
+| REC | `rec_count` | Shared repetition-completion state; answer is `str(count)` with no additional QA model call |
+| CRR | `evidence_memory` | Shared short event records, lexical retrieval for the current question, and a new Yes/No decision using text plus recent frames |
+
+REC uses `RecCountSession` in `lib/ovo_task_memory.py`, shared by source video
+and normalized activity. It sends **all sampled frames** at the default
+`--rec_fps 2`, rather than selecting FOLIO keyframes. Four-second windows keep
+one second of earlier overlap and actor/phase state for cross-boundary motions.
+The writer returns visible completion events with an actor and an exact supplied
+`end_frame_index`; Python maps the frame to its timestamp, enforces ownership by
+the current window, and deduplicates by actor and completion frame time.
+Completions become committed when a window closes. At an earlier question time,
+the unfinished window is recomputed and its provisional completions **replace**
+the previous provisional result, so repeated questions do not add the same count
+again. Only frames at or before the query time are supplied. If a processing gap
+remains, the route records `count_complete=false` and returns an error rather
+than presenting an incomplete count as a complete answer. A successful
+`count_complete` status means processing succeeded, not that visual counting
+has been proven correct.
+
+CRR uses `CrrEvidenceSession` at the main `--fps` (default 1 fps), with
+eight-second windows and one second of earlier overlap. Its question-independent
+writer produces short JSON event records anchored to supplied frames. Completed
+windows are committed and an unfinished window's provisional records are
+replaced as it grows. At query time, lightweight lexical matching against the
+current question packs timestamped observations into at most 8 KiB; the QA model
+uses those observations and recent frames to decide Yes/No again. Previous
+predicted Yes/No answers and sufficiency decisions are not saved as visual facts.
+Failed intervals are marked as incomplete evidence.
+
+**CRR uses a bounded-start protocol, not complete-prefix memory.** For each
+source video, its memory begins one recent window before the earliest CRR
+`ask_time`, clamped to zero. Missing `ask_time` falls back to query times, giving
+the earliest query time when it is absent throughout the group. An arrival time
+after its query is clamped to that query. The default recent window is four
+seconds (`recent_frames_only * chunk_duration`). Earlier events are unavailable
+to this route, which can affect questions that need pre-arrival evidence. The
+start is recorded as `crr_memory_start_time`; annotated answers and clue times
+do not set it. The frame filter still decodes the source sequentially from the
+beginning and discards samples before that start. It saves VLM writing over
+that earlier interval; it does not eliminate the prefix decoding cost. This
+protocol difference must be stated when comparing results.
+
+The earlier policies remain available through explicit CLI selection:
+
+| Policy | RT | BT and FT (REC/SSR/CRR) |
+| --- | --- | --- |
+| `all` | Advance memory and retrieve using the selected FOLIO profile | Same |
+| `task_routed` | Original OVO prompt and recent frames only; no memory advance or retrieval | Advance shared FOLIO memory to the question time, retrieve historical text, answer with text plus recent frames |
+
+Both `task_routed` and `task_state` override the profile's SemLink, historical-image replay,
+interaction focus, and structured answer wrapper to **off**. They preserve the
+original letter/number/Yes-No answer contract. Retrieval uses the existing
+deterministic entity/event matcher and its 8 KiB text budget for FOLIO text
+routes; CRR uses the lexical event matcher described above. This is an
+explicit speed/accuracy trade-off; conceptual matches may be missed without
+SemLink and details absent from text cannot be recovered from historical images.
+
+For example, from the `video` directory, with dataset/model paths set for the
+machine:
+
+```bash
+python main_experiments/eval_qwen3vl_ovo_folio_fast.py \
+  --model_path /path/to/Qwen3-VL-8B \
+  --anno_path /path/to/ovo_bench_new.json \
+  --chunked_dir /path/to/chunked_videos \
+  --result_dir main_experiments/results/ovo_folio_task_state_v1 \
+  --folio_query_policy task_state \
+  --recent_frames_only 4 \
+  --fps 1 \
+  --rec_fps 2 \
+  --rec_window_seconds 4 \
+  --crr_window_seconds 8 \
+  --task_memory_tokens 384 \
+  --folio_segment_seconds 16 \
+  --folio_generation_cap 1024
+```
+
+`--task_memory_tokens` caps each REC/CRR writer response; it does not change the
+BT FOLIO writer cap. REC and CRR overlap is one second in their session defaults.
+Use a fresh result directory when changing policies or processing settings. The
+runner rejects checkpoints from a different policy, including legacy `all`
+checkpoints, and rejects an incompatible `task_state_protocol` schema
+(currently `ovo-task-state-v1`). At startup, `task_state` also saves
+`task_state_run_config.json`: all CLI settings except `result_dir`, including
+the model path, sampling rates, windows, token budgets, task selection/sharding
+settings, plus the protocol and SHA256 hashes of the annotation, runner, and
+task-memory implementation. Resuming requires an
+identical manifest; existing task-state results without a manifest are rejected.
+This prevents changed settings or annotations from being mixed into the same
+checkpoint. The manifest records paths rather than hashing model weights or
+video contents, so replacing those files in place still requires a fresh run.
+Updating code does not switch processes that are already running;
+existing runs continue with the policy loaded at process startup.
+Per-video sharding remains available with `--num_shards` and `--shard_index`;
+its cost estimate follows the selected task routes.
+
+Memory is built lazily: an RT question, or SSR under `task_state`, does not
+advance a history decoder. A later memory-routed query consumes only the
+outstanding history through its timestamp. Committed segments/windows are
+shared across questions; REC/CRR may revisit only an unfinished window. BT and
+CRR writers are question-independent; REC receives the activity to count, but
+no ground-truth count. Writers receive no answers or future frames. In a mixed
+video, an earlier history query can still delay a later RT query in this
+sequential runner; this is not a background writer service.
+
+Each result records `folio_query_policy`, `task_state_protocol`, `memory_route`,
+and `memory_used`. The latter identifies selected FOLIO records, use of the REC
+counter, or nonempty CRR evidence text; it is not a correctness flag. Timings
+include:
+
+- `memory_advance_seconds`: prefix decoding, segment selection, and writing;
+- `retrieval_seconds`: query preparation and retrieval;
+- `answer_seconds`: recent-window decode and answer generation, including retries
+  (zero for REC's direct count answer);
+- `query_wall_seconds`: total time inside this query, including the above;
+- `write_calls_delta`, `write_seconds_delta`, `write_errors_delta`, and
+  `semantic_link_calls_delta`: new work performed for this question.
+
+REC also records `count_events` and CRR records the retrieved `evidence_text`
+so the observations behind an answer can be inspected. `writer_events_emitted`
+and `writer_events_kept` count parsed writer records before and after overlap
+ownership/deduplication; provisional rewrites can contribute more than once to
+these diagnostics, so they are not repetition counts.
+
+Sum the **delta** fields across questions. Existing `write_seconds` and
+`write_calls` fields are cumulative within a session and must not be summed over
+every question. REC/CRR additionally expose processing `status`, `gaps`, and
+provisional record counts; REC exposes `cumulative_count` and `count_complete`.
+Baseline runners have different `generate_time` boundaries;
+compare end-to-end wall time with the same samples and image formatting.
+
+These routes remove memory work from the RT path, but do not remove the first
+historical query's observation cost. The BT FOLIO structured writer remains
+unchanged (and is still used for FT under the earlier policies). Lowering a
+writer's token cap can truncate JSON and lose a segment/window; monitor
+`write_errors_delta` as well as speed. At 1 fps with 16-frame segments and a
+four-frame recent window, the BT FOLIO route can leave roughly 12 seconds of
+pending history outside both committed text and recent visual evidence.
+REC's 2 fps sampling can miss fast repetitions or confuse actors, and CRR's
+compact event text can omit decisive details. The new visual perception,
+sampling choices, accuracy, and full-model speed have not been established by
+state-machine tests and need separate measurement.
+
+The fast runner shares memory **within one run**; it does not save/load memory
+snapshots. Resuming an unfinished video rebuilds its causal history. Persistent
+cross-run caching would require compatible model/config keys and timestamped
+states; loading a final-video state for an earlier question would leak future
+information.
 
 Run the checks with:
 

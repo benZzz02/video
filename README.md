@@ -188,6 +188,23 @@ FOLIO does not currently publish runtime source code or every numerical
 hyperparameter, so this mode is explicitly paper-based rather than an official
 reproduction. [Design, defaults, usage, and checks](docs/folio_memory.md).
 
+For OVO, `main_experiments/eval_qwen3vl_ovo_folio_fast.py` defaults to
+`--folio_query_policy task_state`: RT/SSR use recent frames, BT uses shared
+FOLIO text, REC maintains a repetition counter, and CRR retrieves timestamped
+event text before deciding Yes/No from that evidence and recent frames. REC
+defaults to all frames sampled at 2 fps in four-second windows; CRR uses
+eight-second windows at the main `--fps` and starts one recent window before
+the video's earliest CRR question arrival. Frames before that memory start are
+still decoded sequentially, but incur no CRR VLM writing.
+Memory is shared within the run, without cross-run persistence. Use a fresh
+result directory; policy/schema guards reject incompatible checkpoints, and
+`task_state_run_config.json` requires matching model, sampling, window, token,
+selection settings, and annotation SHA256 when resuming. The
+earlier `all` and `task_routed` policies require explicit selection, and running
+processes retain their loaded policy. Per-stage timings are reported; real-model
+speed and accuracy of the new sampling and state logic still need measurement. See the
+[OVO routing details and limitations](docs/folio_memory.md#ovo-shared-memory-and-task-routing).
+
 ## Contact
 
 If you have any questions about the paper, codebase, or experimental setup, please feel free to contact [shenyujiao18@gmail.com](mailto:shenyujiao18@gmail.com).
